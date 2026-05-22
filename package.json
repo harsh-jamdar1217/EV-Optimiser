@@ -1,0 +1,19 @@
+{
+  "name": "ev-optimizer",
+  "private": true,
+  "version": "1.0.0",
+  "workspaces": [
+    "client",
+    "server"
+  ],
+  "scripts": {
+    "dev": "concurrently -n client,server -c cyan,green \"npm:dev -w client\" \"npm:dev -w server\"",
+    "build": "npm -w client run build",
+    "start": "npm -w server start"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.0"
+  }
+
+}
+
