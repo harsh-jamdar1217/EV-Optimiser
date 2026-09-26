@@ -7,3 +7,5 @@ build
 *.log
 package-lock.json
 
+
+server/env
