@@ -1,4 +1,6 @@
 const { supabase } = require('../db');
+const { loadState, pickNumber } = require('../services/vehicleState');
+const { usableCapacityKwh, effectiveSohPct } = require('../services/evModel');
 
 exports.getChargingAdvice = async (req, res) => {
   try {
@@ -8,11 +10,7 @@ exports.getChargingAdvice = async (req, res) => {
       target_soc = 80,
       charger_type = 'AC Fast',
       charger_power,
-      start_hour = 22,
-      temperature = 25,
-      peakRate = 0.32,
-      offPeakRate = 0.09,
-      midPeakRate = 0.16
+      start_hour = 22
     } = req.body;
 
     if (!profile_id) {
@@ -29,6 +27,15 @@ exports.getChargingAdvice = async (req, res) => {
     if (profileError || !profile) {
       return res.status(404).json({ ok: false, message: 'EV profile not found in database.' });
     }
+
+    // Shared vehicle state: request value > saved state > default
+    const state = await loadState(profile_id);
+    const temperature = pickNumber(req.body.temperature, state.ambient_temp_c, 25);
+    const peakRate = pickNumber(req.body.peakRate, state.tariff_peak, 0.32);
+    const offPeakRate = pickNumber(req.body.offPeakRate, state.tariff_offpeak, 0.09);
+    const midPeakRate = pickNumber(req.body.midPeakRate, state.tariff_mid, 0.16);
+    // A degraded pack holds less energy, so the same SOC swing is fewer kWh
+    const usableKwh = usableCapacityKwh(profile, state.soh_pct);
 
     const startSOC = Number(current_soc);
     const endSOC = Number(target_soc);
@@ -135,7 +142,7 @@ exports.getChargingAdvice = async (req, res) => {
 
         // Calculate energy added this step
         const energyAdded = actualPower * (dt / 60); // kWh
-        const socAdded = (energyAdded / profile.battery_capacity) * 100;
+        const socAdded = (energyAdded / usableKwh) * 100;
 
         currentSOC = Math.min(finalSoc, currentSOC + socAdded);
         minutesElapsed += dt;
@@ -210,7 +217,10 @@ exports.getChargingAdvice = async (req, res) => {
         simCurve: results.simCurve,
         costOptimizationCurve,
         cheapestHour,
-        minCost
+        minCost,
+        tariffs: { peak: peakRate, mid: midPeakRate, offPeak: offPeakRate },
+        sohPct: Number(effectiveSohPct(state.soh_pct).toFixed(1)),
+        usableCapacityKwh: Number(usableKwh.toFixed(1))
       }
     });
 

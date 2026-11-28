@@ -1,4 +1,6 @@
 const { supabase } = require('../db');
+const { saveState } = require('../services/vehicleState');
+const { isLfp: isLfpProfile, chemistryLabel } = require('../services/evModel');
 
 exports.assessHealth = async (req, res) => {
   try {
@@ -37,10 +39,8 @@ exports.assessHealth = async (req, res) => {
     const voltageDeviation = maxV - minV;
 
     // 2. Battery Chemistry Profile
-    const isLfp = profile.battery_capacity <= 30 || 
-                  profile.vehicle_model.toLowerCase().includes('lfp') || 
-                  profile.vehicle_model.toLowerCase().includes('standard range');
-    const chemistry = isLfp ? 'LFP (Lithium Iron Phosphate)' : 'NMC (Nickel Manganese Cobalt)';
+    const isLfp = isLfpProfile(profile);
+    const chemistry = chemistryLabel(profile);
 
     // 3. SOH Calculation
     // Cycle wear deduction: LFP is more durable (0.003% SOH per cycle), NMC is less (0.0065% SOH per cycle)
@@ -100,6 +100,8 @@ exports.assessHealth = async (req, res) => {
     };
 
     let analysisData = null;
+    let stateUpdated = false;
+    let stateWarning = null;
     if (save_to_db === true || save_to_db === 'true') {
       const { data, error } = await supabase
         .from('analysis_results')
@@ -115,6 +117,20 @@ exports.assessHealth = async (req, res) => {
         throw error;
       }
       analysisData = data;
+
+      // Publish this SOH as the vehicle's current SOH so Range, Charging,
+      // Degradation, Performance and Digital Twin all use the same value.
+      try {
+        await saveState(profile.id, {
+          soh_pct: Number(soh.toFixed(1)),
+          soh_source: 'health_assessment',
+          soh_updated_at: new Date().toISOString(),
+        });
+        stateUpdated = true;
+      } catch (stateErr) {
+        console.error('Could not update vehicle_state from health assessment:', stateErr);
+        stateWarning = 'Diagnostic saved, but the shared SOH could not be updated (is vehicle_state migrated?).';
+      }
     }
 
     return res.json({
@@ -135,7 +151,9 @@ exports.assessHealth = async (req, res) => {
         thermalStatus,
         healthScore,
         chemistry,
-        analysis: analysisData
+        analysis: analysisData,
+        sharedSohUpdated: stateUpdated,
+        warning: stateWarning
       }
     });
 

@@ -24,6 +24,7 @@ app.use('/api/health', require('./routes/health'));
 app.use('/api/ai', require('./routes/ai'));
 app.use('/api/digitalTwin', require('./routes/digitalTwin'));
 app.use('/api/report', require('./routes/report'));
+app.use('/api/vehicle-state', require('./routes/vehicleState'));
 
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true, service: 'ev-optimizer-server' });

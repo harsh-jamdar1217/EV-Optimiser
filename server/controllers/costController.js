@@ -1,11 +1,11 @@
 const { supabase } = require('../db');
+const { loadState, pickNumber, blendedTariff } = require('../services/vehicleState');
+const { baseConsumptionKwhPer100km } = require('../services/evModel');
 
 exports.getCostComparison = async (req, res) => {
   try {
     const {
       profile_id,
-      annual_mileage = 15000,
-      electricity_rate = 0.15,
       gasoline_price = 1.20,
       ice_fuel_economy = 7.5,
       charging_efficiency = 90,
@@ -28,6 +28,12 @@ exports.getCostComparison = async (req, res) => {
       return res.status(404).json({ ok: false, message: 'EV profile not found in database.' });
     }
 
+    // Shared vehicle state: request value > saved state > default.
+    // Saved time-of-use tariffs are blended into one flat rate for the annual view.
+    const state = await loadState(profile_id);
+    const annual_mileage = pickNumber(req.body.annual_mileage, state.annual_mileage_km, 15000);
+    const electricity_rate = pickNumber(req.body.electricity_rate, blendedTariff(state), 0.15);
+
     const mileage = Math.max(0, Number(annual_mileage));
     const elecRate = Math.max(0, Number(electricity_rate));
     const gasPrice = Math.max(0, Number(gasoline_price));
@@ -37,7 +43,7 @@ exports.getCostComparison = async (req, res) => {
     const co2Factor = Math.max(0, Number(grid_co2_factor));
 
     // 1. Calculate EV Energy & Cost
-    const evConsumptionRate = (profile.vehicle_weight / 100) * 0.8 + (profile.motor_power / 20); // kWh/100km
+    const evConsumptionRate = baseConsumptionKwhPer100km(profile); // kWh/100km
     const annualEvKwh = (mileage / 100) * evConsumptionRate;
     const gridKwhDrawn = annualEvKwh / (efficiency / 100);
     const annualEvFuelCost = gridKwhDrawn * elecRate;

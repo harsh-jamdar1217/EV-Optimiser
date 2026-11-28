@@ -19,3 +19,27 @@ CREATE TABLE IF NOT EXISTS analysis_results (
     FOREIGN KEY (profile_id) REFERENCES ev_profiles(id)
     ON DELETE CASCADE
 );
+
+
+-- Shared per-vehicle state (see migrations/001_vehicle_state.sql)
+
+CREATE TABLE IF NOT EXISTS vehicle_state (
+  profile_id BIGINT PRIMARY KEY
+    REFERENCES ev_profiles(id) ON DELETE CASCADE,
+
+  soh_pct REAL CHECK (soh_pct BETWEEN 40 AND 100),
+  soh_source TEXT CHECK (soh_source IN ('health_assessment', 'degradation_forecast', 'manual')),
+  soh_updated_at TIMESTAMP WITH TIME ZONE,
+
+  ambient_temp_c REAL CHECK (ambient_temp_c BETWEEN -40 AND 70),
+  odometer_km REAL CHECK (odometer_km BETWEEN 0 AND 1000000),
+  annual_mileage_km REAL CHECK (annual_mileage_km BETWEEN 0 AND 200000),
+  fast_charge_ratio_pct REAL CHECK (fast_charge_ratio_pct BETWEEN 0 AND 100),
+  charge_limit_pct REAL CHECK (charge_limit_pct BETWEEN 50 AND 100),
+
+  tariff_peak REAL CHECK (tariff_peak >= 0),
+  tariff_mid REAL CHECK (tariff_mid >= 0),
+  tariff_offpeak REAL CHECK (tariff_offpeak >= 0),
+
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);

@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "nodemon server.js",
     "build": "echo 'No build step required'",
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node test/linkage.test.js"
   },
   "dependencies": {
     "@google/generative-ai": "^0.21.0",

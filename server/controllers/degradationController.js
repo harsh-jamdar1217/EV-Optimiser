@@ -1,15 +1,15 @@
 const { supabase } = require('../db');
+const { loadState, saveState, pickNumber } = require('../services/vehicleState');
+const {
+  clamp,
+  chemistryLabel,
+  annualDegradation,
+  estimateCurrentSoh,
+} = require('../services/evModel');
 
 exports.getDegradationForecast = async (req, res) => {
   try {
-    const {
-      profile_id,
-      current_odometer = 20000,
-      annual_mileage = 12000,
-      fast_charging_ratio = 20,
-      avg_charging_limit = 90,
-      avg_temperature = 25
-    } = req.body;
+    const { profile_id } = req.body;
 
     if (!profile_id) {
       return res.status(400).json({ ok: false, message: 'Active EV profile ID is required.' });
@@ -26,135 +26,120 @@ exports.getDegradationForecast = async (req, res) => {
       return res.status(404).json({ ok: false, message: 'EV profile not found in database.' });
     }
 
-    const odometer = Math.max(0, Number(current_odometer));
-    const annualDist = Math.max(0, Number(annual_mileage));
-    const dcRatio = Math.max(0, Math.min(100, Number(fast_charging_ratio)));
-    const chargeLimit = Math.max(50, Math.min(100, Number(avg_charging_limit)));
-    const temp = Number(avg_temperature);
+    // Shared vehicle state: request value > saved state > default
+    const state = await loadState(profile_id);
+    const odometer = Math.max(0, pickNumber(req.body.current_odometer, state.odometer_km, 20000));
+    const annualDist = Math.max(0, pickNumber(req.body.annual_mileage, state.annual_mileage_km, 12000));
+    const dcRatio = clamp(pickNumber(req.body.fast_charging_ratio, state.fast_charge_ratio_pct, 20), 0, 100);
+    const chargeLimit = clamp(pickNumber(req.body.avg_charging_limit, state.charge_limit_pct, 90), 50, 100);
+    const temp = pickNumber(req.body.avg_temperature, state.ambient_temp_c, 25);
 
-    // Chemistry proxy (LFP vs NMC)
-    const modelLower = profile.vehicle_model.toLowerCase();
-    const isLFP = modelLower.includes('lfp') || modelLower.includes('nexon ev max') || profile.battery_capacity <= 30;
-    const baseCycleLife = isLFP ? 3200 : 1800; // LFP lasts significantly longer
-    const calendarSensitivityToHighSoc = isLFP ? 0.25 : 1.0; // LFP is highly resistant to calendar aging at high SOC
+    const currentRates = annualDegradation({
+      profile, tempC: temp, chargeLimitPct: chargeLimit, dcPct: dcRatio, annualDistKm: annualDist,
+    });
 
-    // Average consumption (kWh/100km)
-    const consumptionRate = (profile.vehicle_weight / 100) * 0.8 + (profile.motor_power / 20);
-
-    // Helpers for annual degradation calculations
-    const calculateAnnualDegradation = (t, limit, dcPct) => {
-      // 1. Calendar wear factor (Arrhenius-style temperature wear + high SOC stress)
-      const tempFactor = Math.max(0.15, Math.min(8.0, Math.exp((t - 20) / 12)));
-      const socFactor = 1.0 + Math.pow(Math.max(0, limit - 70) / 30, 1.6) * 0.7 * calendarSensitivityToHighSoc;
-      const annualCalendarLoss = 1.25 * tempFactor * socFactor; // base calendar loss per year
-
-      // 2. Cyclic wear factor (mileage throughput equivalent full cycles + DC fast charge stress)
-      const annualKwhThroughput = (annualDist / 100) * consumptionRate;
-      const cyclesPerYear = annualKwhThroughput / profile.battery_capacity;
-      const dcMultiplier = 1.0 + (dcPct / 100) * 1.6;
-      const annualCyclicLoss = cyclesPerYear * (20.0 / baseCycleLife) * dcMultiplier; // base cyclic wear per year
-
-      return {
-        annualCalendarLoss,
-        annualCyclicLoss,
-        totalAnnualLoss: annualCalendarLoss + annualCyclicLoss
-      };
-    };
-
-    // Calculate current State of Health (SOH) based on past mileage and age
-    const currentAgeYears = Math.max(0.5, new Date().getFullYear() - profile.manufacturing_year);
-    const pastCycles = ((odometer / 100) * consumptionRate) / profile.battery_capacity;
-    
-    // Past degradation parameters (based on user inputs)
-    const currentRates = calculateAnnualDegradation(temp, chargeLimit, dcRatio);
-    const pastCalendarWear = currentAgeYears * currentRates.annualCalendarLoss;
-    const pastCyclicWear = pastCycles * (20.0 / baseCycleLife) * (1.0 + (dcRatio / 100) * 1.6);
-    
-    // Start SOH
-    const currentSOH = Math.max(50, Math.min(100, 100 - pastCalendarWear - pastCyclicWear));
+    // Starting SOH, in order of trust:
+    //  1) explicit value in the request
+    //  2) a SOH saved from a health assessment (or entered manually)
+    //  3) the age + mileage model (also what Digital Twin uses)
+    let currentSOH;
+    let sohBasis;
+    if (req.body.current_soh !== undefined && req.body.current_soh !== null && req.body.current_soh !== '') {
+      currentSOH = clamp(Number(req.body.current_soh), 40, 100);
+      sohBasis = 'request';
+    } else if (state.soh_pct !== null && state.soh_source !== 'degradation_forecast') {
+      currentSOH = Number(state.soh_pct);
+      sohBasis = state.soh_source; // 'health_assessment' | 'manual'
+    } else {
+      currentSOH = estimateCurrentSoh({
+        profile, odometerKm: odometer, tempC: temp, chargeLimitPct: chargeLimit, dcPct: dcRatio, annualDistKm: annualDist,
+      }).soh;
+      sohBasis = 'age_and_odometer_model';
+    }
     const remainingCapacityKwh = profile.battery_capacity * (currentSOH / 100);
-
-    // Future 10-Year Projections
-    const baselineSohCurve = [];
-    const optimizedSohCurve = [];
-
-    // Current inputs aging rate
-    const baselineAnnualLoss = currentRates.totalAnnualLoss;
 
     // Optimized aging parameters
     const optTemp = Math.min(22, temp);
     const optLimit = 80;
     const optDcPct = Math.min(10, dcRatio * 0.25);
-    const optimizedRates = calculateAnnualDegradation(optTemp, optLimit, optDcPct);
+    const optimizedRates = annualDegradation({
+      profile, tempC: optTemp, chargeLimitPct: optLimit, dcPct: optDcPct, annualDistKm: annualDist,
+    });
+
+    const baselineAnnualLoss = currentRates.totalAnnualLoss;
     const optimizedAnnualLoss = optimizedRates.totalAnnualLoss;
 
     // Build the curves (Year 0 to 10)
-    let tempBaselineSoh = currentSOH;
-    let tempOptimizedSoh = currentSOH;
-
-    baselineSohCurve.push({
-      year: 0,
-      soh: Number(tempBaselineSoh.toFixed(1)),
-      capacity: Number((profile.battery_capacity * (tempBaselineSoh / 100)).toFixed(1))
+    const point = (year, soh) => ({
+      year,
+      soh: Number(soh.toFixed(1)),
+      capacity: Number((profile.battery_capacity * (soh / 100)).toFixed(1)),
     });
-
-    optimizedSohCurve.push({
-      year: 0,
-      soh: Number(tempOptimizedSoh.toFixed(1)),
-      capacity: Number((profile.battery_capacity * (tempOptimizedSoh / 100)).toFixed(1))
-    });
-
+    const baselineSohCurve = [point(0, currentSOH)];
+    const optimizedSohCurve = [point(0, currentSOH)];
+    let baseSoh = currentSOH;
+    let optSoh = currentSOH;
     for (let y = 1; y <= 10; y++) {
-      tempBaselineSoh = Math.max(40, tempBaselineSoh - baselineAnnualLoss);
-      tempOptimizedSoh = Math.max(40, tempOptimizedSoh - optimizedAnnualLoss);
-
-      baselineSohCurve.push({
-        year: y,
-        soh: Number(tempBaselineSoh.toFixed(1)),
-        capacity: Number((profile.battery_capacity * (tempBaselineSoh / 100)).toFixed(1))
-      });
-
-      optimizedSohCurve.push({
-        year: y,
-        soh: Number(tempOptimizedSoh.toFixed(1)),
-        capacity: Number((profile.battery_capacity * (tempOptimizedSoh / 100)).toFixed(1))
-      });
+      baseSoh = Math.max(40, baseSoh - baselineAnnualLoss);
+      optSoh = Math.max(40, optSoh - optimizedAnnualLoss);
+      baselineSohCurve.push(point(y, baseSoh));
+      optimizedSohCurve.push(point(y, optSoh));
     }
 
     // Lifespan estimation (years until SOH hits 70% threshold)
     const sohLossRemaining = Math.max(0, currentSOH - 70);
-    
-    const yearsRemainingBaseline = baselineAnnualLoss > 0 ? (sohLossRemaining / baselineAnnualLoss) : 100;
-    const kmRemainingBaseline = yearsRemainingBaseline * annualDist;
+    const yearsRemainingBaseline = baselineAnnualLoss > 0 ? sohLossRemaining / baselineAnnualLoss : 100;
+    const yearsRemainingOptimized = optimizedAnnualLoss > 0 ? sohLossRemaining / optimizedAnnualLoss : 100;
 
-    const yearsRemainingOptimized = optimizedAnnualLoss > 0 ? (sohLossRemaining / optimizedAnnualLoss) : 100;
-    const kmRemainingOptimized = yearsRemainingOptimized * annualDist;
+    // Optional: publish the model estimate as the shared SOH. Never overwrites a
+    // SOH that came from a health assessment or was entered manually.
+    let sharedSohUpdated = false;
+    let sharedSohNote = null;
+    if (req.body.save_to_state === true || req.body.save_to_state === 'true') {
+      if (sohBasis !== 'age_and_odometer_model') {
+        sharedSohNote = 'Shared SOH left unchanged: forecast started from a measured/entered SOH.';
+      } else {
+        try {
+          await saveState(profile.id, {
+            soh_pct: Number(currentSOH.toFixed(1)),
+            soh_source: 'degradation_forecast',
+            soh_updated_at: new Date().toISOString(),
+          });
+          sharedSohUpdated = true;
+        } catch (stateErr) {
+          console.error('Could not update vehicle_state from degradation forecast:', stateErr);
+          sharedSohNote = 'Could not save shared SOH (is vehicle_state migrated?).';
+        }
+      }
+    }
 
     return res.json({
       ok: true,
       data: {
         profile_id,
-        chemistry: isLFP ? 'LFP (Lithium Iron Phosphate)' : 'NMC (Nickel Manganese Cobalt)',
+        chemistry: chemistryLabel(profile),
         currentSOH: Number(currentSOH.toFixed(1)),
+        sohBasis,
         remainingCapacityKwh: Number(remainingCapacityKwh.toFixed(1)),
         baselineSohCurve,
         optimizedSohCurve,
         baselineLifespan: {
           years: Number(yearsRemainingBaseline.toFixed(1)),
-          km: Math.round(kmRemainingBaseline)
+          km: Math.round(yearsRemainingBaseline * annualDist),
         },
         optimizedLifespan: {
           years: Number(yearsRemainingOptimized.toFixed(1)),
-          km: Math.round(kmRemainingOptimized)
+          km: Math.round(yearsRemainingOptimized * annualDist),
         },
         annualSavingsYears: Number((yearsRemainingOptimized - yearsRemainingBaseline).toFixed(1)),
         baselineAnnualLoss: Number(baselineAnnualLoss.toFixed(2)),
-        optimizedAnnualLoss: Number(optimizedAnnualLoss.toFixed(2))
-      }
+        optimizedAnnualLoss: Number(optimizedAnnualLoss.toFixed(2)),
+        sharedSohUpdated,
+        sharedSohNote,
+      },
     });
-
   } catch (error) {
-    console.error("degradation forecast error:", error);
+    console.error('degradation forecast error:', error);
     return res.status(500).json({ ok: false, message: 'Server error computing degradation forecast.' });
   }
 };

@@ -1,4 +1,6 @@
 const { supabase } = require('../db');
+const { loadState, pickNumber } = require('../services/vehicleState');
+const { consumptionKwhPer100km, usableCapacityKwh, effectiveSohPct } = require('../services/evModel');
 
 exports.analyzePerformance = async (req, res) => {
   try {
@@ -21,26 +23,20 @@ exports.analyzePerformance = async (req, res) => {
 
     const distance = Number(daily_distance) || 0;
     const speed = Number(average_speed) || 0;
-    
-    // 1. Calculate Energy Consumption (kWh/100km)
-    // Base consumption model based on vehicle weight and motor power
-    let baseConsumption = (profile.vehicle_weight / 100) * 0.8 + (profile.motor_power / 20);
-    
-    // Apply speed multiplier (speeds > 80km/h increase consumption exponentially)
-    let speedMultiplier = 1.0;
-    if (speed > 80) {
-      speedMultiplier = 1.0 + ((speed - 80) * 0.015);
-    } else if (speed < 30) {
-       // Stop and go traffic
-      speedMultiplier = 1.1; 
-    }
 
-    // Apply driving style multiplier
-    let styleMultiplier = 1.0;
-    if (driving_style === 'Eco') styleMultiplier = 0.85;
-    if (driving_style === 'Sport') styleMultiplier = 1.25;
+    // Shared vehicle state: ambient temperature and SOH come from saved state
+    const state = await loadState(profile_id);
+    const ambientTemp = pickNumber(req.body.temperature, state.ambient_temp_c, 25);
+    const usableKwh = usableCapacityKwh(profile, state.soh_pct);
 
-    const energyConsumption = baseConsumption * speedMultiplier * styleMultiplier;
+    // 1. Energy consumption (kWh/100km) -- same model as the Range page
+    const energyConsumption = consumptionKwhPer100km({
+      profile,
+      speedKmh: speed,
+      temperatureC: ambientTemp,
+      hvac: false,
+      style: driving_style,
+    });
 
     // 2. Efficiency Score (0-100)
     // Assuming 12 kWh/100km is fantastic (score 100) and 30 kWh/100km is poor (score 20)
@@ -48,7 +44,7 @@ exports.analyzePerformance = async (req, res) => {
     efficiencyScore = Math.max(10, Math.min(100, efficiencyScore));
 
     // 3. Estimated Real-World Range
-    const estimatedRange = (profile.battery_capacity / energyConsumption) * 100;
+    const estimatedRange = (usableKwh / energyConsumption) * 100;
 
     // 4. Range Utilization (%)
     const rangeUtilization = distance > 0 ? (distance / estimatedRange) * 100 : 0;
@@ -69,7 +65,10 @@ exports.analyzePerformance = async (req, res) => {
       performanceScore: Math.round(performanceScore),
       driving_style,
       daily_distance: distance,
-      average_speed: speed
+      average_speed: speed,
+      ambientTemp,
+      sohPct: Number(effectiveSohPct(state.soh_pct).toFixed(1)),
+      usableCapacityKwh: Number(usableKwh.toFixed(1))
     };
 
     // Save to Supabase
